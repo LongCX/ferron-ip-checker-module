@@ -78,5 +78,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ferron-module-ip-block-binaries
-          path: ../target/*
+          path: ferron/target/release/*
           if-no-files-found: error
