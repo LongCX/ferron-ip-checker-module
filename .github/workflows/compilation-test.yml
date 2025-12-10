@@ -40,14 +40,14 @@ jobs:
           cmd: |
             yq -i '.modules |= (
                   (.[] | select(
-                    .loader == "ReverseProxyModuleLoader"
+                    .loader == "CoreModuleLoader"
                   ) | key + 1) as $pos |
                   .[:$pos] +
                   [
                     {
                       "path": "${{ github.workspace }}/module",
-                      "crate": "ferron-module-example",
-                      "loader": "ExampleModuleLoader"
+                      "crate": "ferron-module-ip-block",
+                      "loader": "IpBlockModuleLoader"
                     }
                   ] +
                   .[$pos:])' ferron/ferron-build-override.yaml
