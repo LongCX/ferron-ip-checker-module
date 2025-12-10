@@ -1,187 +1,239 @@
-//! This module provides an example implementation of a Ferron server module.
-//! It demonstrates how to create a simple HTTP handler that responds to specific paths.
-
+use std::collections::HashSet;
 use std::error::Error;
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::{Request, Response};
+use hyper::{Request, Response, StatusCode};
+use moka::future::Cache;
+use serde::Deserialize;
 
 use ferron_common::config::ServerConfiguration;
-use ferron_common::get_entries_for_validation;
 use ferron_common::logging::ErrorLogger;
 use ferron_common::modules::{Module, ModuleHandlers, ModuleLoader, ResponseData, SocketData};
 use ferron_common::util::ModuleCache;
+use ferron_common::{get_entries_for_validation, get_entry};
 
-/// An example module loader that demonstrates how to create and manage modules in Ferron.
-///
-/// The module loader is responsible for:
-/// 1. Creating modules based on server configuration
-/// 2. Caching modules to avoid recreating them for identical configurations
-/// 3. Validating configuration parameters
-pub struct ExampleModuleLoader {
-  /// Module cache that stores instances of ExampleModule indexed by configuration parameters
-  cache: ModuleCache<ExampleModule>,
+#[derive(Deserialize)]
+struct ApiResponse {
+  blocked: u8,
 }
 
-impl Default for ExampleModuleLoader {
+#[derive(Clone, Copy, Debug)]
+enum BlockStatus {
+  Allowed,
+  Blocked,
+}
+
+pub struct IpBlockModuleLoader {
+  cache: ModuleCache<IpBlockModule>,
+}
+
+impl Default for IpBlockModuleLoader {
   fn default() -> Self {
     Self::new()
   }
 }
 
-impl ExampleModuleLoader {
-  /// Creates a new module loader with an empty cache
-  ///
-  /// Returns a ready-to-use ExampleModuleLoader instance that can create and cache
-  /// ExampleModule instances based on server configurations.
+impl IpBlockModuleLoader {
   pub fn new() -> Self {
     Self {
-      // Initialize with an empty vector since this module doesn't depend on specific properties
-      cache: ModuleCache::new(vec![]),
+      cache: ModuleCache::new(vec!["ip_block"]),
     }
   }
 }
 
-impl ModuleLoader for ExampleModuleLoader {
-  /// Creates or retrieves a cached module instance based on the server configuration
-  ///
-  /// # Parameters
-  /// * `config` - The server configuration for this specific module instance
-  /// * `_global_config` - Optional global server configuration (unused in this example)
-  /// * `_secondary_runtime` - A reference to the secondary Tokio runtime for asynchronous operations (unused in this example)
-  ///
-  /// # Returns
-  /// A thread-safe, reference-counted module instance that implements the Module trait
+impl ModuleLoader for IpBlockModuleLoader {
   fn load_module(
     &mut self,
     config: &ServerConfiguration,
     _global_config: Option<&ServerConfiguration>,
     _secondary_runtime: &tokio::runtime::Runtime,
   ) -> Result<Arc<dyn Module + Send + Sync>, Box<dyn Error + Send + Sync>> {
-    // Either get an existing module from cache or create a new one
     Ok(
       self
         .cache
-        .get_or_init::<_, Box<dyn std::error::Error + Send + Sync>>(config, move |_| Ok(Arc::new(ExampleModule)))?,
+        .get_or_init::<_, Box<dyn Error + Send + Sync>>(config, |config| {
+          let block_entry = get_entry!("ip_block", config);
+
+          let api_url = block_entry
+            .and_then(|e| e.props.get("url"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("The `url` property is required for the ip_block module"))?
+            .to_string();
+
+          let timeout_secs = block_entry
+            .and_then(|e| e.props.get("timeout"))
+            .and_then(|v| v.as_i128())
+            .unwrap_or(1);
+
+          let cache_ttl_secs = block_entry
+            .and_then(|e| e.props.get("cache_ttl"))
+            .and_then(|v| v.as_i128())
+            .unwrap_or(3600);
+
+          let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs as u64))
+            .build()?;
+
+          let ip_cache = Cache::builder()
+            .time_to_live(Duration::from_secs(cache_ttl_secs as u64))
+            .build();
+
+          Ok(Arc::new(IpBlockModule {
+            client: Arc::new(client),
+            api_url,
+            ip_cache,
+          }))
+        })?,
     )
   }
 
-  /// Specifies the configuration entries required by this module
-  ///
-  /// # Returns
-  /// A vector of configuration property names that should be present
   fn get_requirements(&self) -> Vec<&'static str> {
-    // This module requires the "example_handler" configuration property
-    vec!["example_handler"]
+    vec!["ip_block"]
   }
 
-  /// Validates that the configuration entries for this module are correct
-  ///
-  /// # Parameters
-  /// * `config` - The server configuration to validate
-  /// * `used_properties` - A set to track which properties have been used/validated
-  ///
-  /// # Returns
-  /// Ok if validation passes, an error with a detailed message otherwise
   fn validate_configuration(
     &self,
     config: &ServerConfiguration,
-    used_properties: &mut std::collections::HashSet<String>,
+    used_properties: &mut HashSet<String>,
   ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // Check if the "example" configuration entry exists and validate it
-    if let Some(entries) = get_entries_for_validation!("example", config, used_properties) {
+    if let Some(entries) = get_entries_for_validation!("ip_block", config, used_properties) {
       for entry in &entries.inner {
-        // Validate that each entry has exactly one value
-        if entry.values.len() != 1 {
+        if entry.values.len() != 1 || !entry.values[0].is_bool() {
           Err(anyhow::anyhow!(
-            "The `example` configuration property must have exactly one value"
+            "The `ip_block` configuration property must have exactly one boolean value"
           ))?
-        // Validate that the value is a boolean
-        } else if !entry.values[0].is_bool() {
-          Err(anyhow::anyhow!("Invalid example handler enabling option"))?
+        }
+
+        if let Some(url_val) = entry.props.get("url") {
+          if !url_val.is_string() {
+            Err(anyhow::anyhow!("The `url` property for ip_block must be a string"))?
+          }
+          if url::Url::parse(url_val.as_str().unwrap()).is_err() {
+            Err(anyhow::anyhow!(
+              "The `url` property '{}' is not a valid URL",
+              url_val.as_str().unwrap()
+            ))?
+          }
+        } else {
+          Err(anyhow::anyhow!(
+            "The `url` property is required for the ip_block module"
+          ))?
+        }
+
+        if !entry.props.get("timeout").is_none_or(|v| v.is_integer()) {
+          Err(anyhow::anyhow!("The `timeout` property must be an integer (seconds)"))?
+        }
+
+        if !entry.props.get("cache_ttl").is_none_or(|v| v.is_integer()) {
+          Err(anyhow::anyhow!("The `cache_ttl` property must be an integer (seconds)"))?
         }
       }
     }
-
     Ok(())
   }
 }
 
-/// A simple example module that demonstrates a basic HTTP request handler
-///
-/// This is implemented as a zero-sized struct since it doesn't need to store any state.
-/// In more complex modules, this would typically contain configuration parameters,
-/// connection pools, or other state needed by the handlers.
-struct ExampleModule;
+struct IpBlockModule {
+  client: Arc<reqwest::Client>,
+  api_url: String,
+  ip_cache: Cache<IpAddr, BlockStatus>,
+}
 
-impl Module for ExampleModule {
-  /// Creates and returns handler instances for this module
-  ///
-  /// # Returns
-  /// A boxed trait object implementing the ModuleHandlers trait
+impl Module for IpBlockModule {
   fn get_module_handlers(&self) -> Box<dyn ModuleHandlers> {
-    // Create a new instance of our handlers and box it
-    Box::new(ExampleModuleHandlers)
+    Box::new(IpBlockModuleHandlers {
+      client: self.client.clone(),
+      api_url: self.api_url.clone(),
+      ip_cache: self.ip_cache.clone(),
+    })
   }
 }
 
-/// Handlers that process HTTP requests for the example module
-///
-/// This implementation demonstrates a simple path-based routing system
-/// that responds with "Hello World!" for requests to "/hello".
-/// For all other paths, it passes the request through without modification.
-struct ExampleModuleHandlers;
+struct IpBlockModuleHandlers {
+  client: Arc<reqwest::Client>,
+  api_url: String,
+  ip_cache: Cache<IpAddr, BlockStatus>,
+}
 
 #[async_trait(?Send)]
-impl ModuleHandlers for ExampleModuleHandlers {
-  /// Processes incoming HTTP requests and generates appropriate responses
-  ///
-  /// # Parameters
-  /// * `request` - The incoming HTTP request with body
-  /// * `_config` - Server configuration (unused in this example)
-  /// * `_socket_data` - Socket connection information (unused in this example)
-  /// * `_error_logger` - Logger for recording errors (unused in this example)
-  ///
-  /// # Returns
-  /// A ResponseData struct containing either a response or the original request
+impl ModuleHandlers for IpBlockModuleHandlers {
   async fn request_handler(
     &mut self,
     request: Request<BoxBody<Bytes, std::io::Error>>,
     _config: &ServerConfiguration,
-    _socket_data: &SocketData,
-    _error_logger: &ErrorLogger,
+    socket_data: &SocketData,
+    error_logger: &ErrorLogger,
   ) -> Result<ResponseData, Box<dyn Error + Send + Sync>> {
-    // Check if the request is for the "/hello" path
-    let is_hello = request.uri().path() == "/hello";
+    let remote_ip = socket_data.remote_addr.ip();
 
-    // Return a ResponseData with appropriate fields
-    Ok(ResponseData {
-      // Include the original request (required for non-handled routes)
-      request: Some(request),
+    let status_result = self
+      .ip_cache
+      .get_with(remote_ip, async {
+        let full_url = format!("{}?ip={}", self.api_url, remote_ip);
 
-      // If path is "/hello", create a response with "Hello World!" body
-      // Otherwise, return None to let other modules handle the request
-      response: if is_hello {
-        Some(
-          Response::builder().body(
-            Full::new("Hello World!".into())
-              .map_err(|e| match e {}) // Empty match because Full::new never fails
-              .boxed(),
-          )?,
-        )
-      } else {
-        None
-      },
-      response_status: None,    // No special status code needed
-      response_headers: None,   // No additional headers needed
-      new_remote_address: None, // No address rewriting needed
-    })
+        match self.client.get(&full_url).send().await {
+          Ok(response) => {
+            if response.status().is_success() {
+              match response.json::<ApiResponse>().await {
+                Ok(api_response) => {
+                  if api_response.blocked == 1 {
+                    BlockStatus::Blocked
+                  } else {
+                    BlockStatus::Allowed
+                  }
+                }
+                Err(e) => {
+                  error_logger
+                    .log(&format!(
+                      "[ip_block] Failed to parse JSON from API: {}. Allowing request.",
+                      e
+                    ))
+                    .await;
+                  BlockStatus::Allowed
+                }
+              }
+            } else {
+              let status = response.status();
+              error_logger
+                .log(&format!(
+                  "[ip_block] API returned non-success status: {}. Allowing request.",
+                  status
+                ))
+                .await;
+              BlockStatus::Allowed
+            }
+          }
+          Err(e) => {
+            error_logger
+              .log(&format!("[ip_block] Failed to call API: {}. Allowing request.", e))
+              .await;
+            BlockStatus::Allowed
+          }
+        }
+      })
+      .await;
+
+    match status_result {
+      BlockStatus::Blocked => Ok(ResponseData {
+        request: Some(request),
+        response: Some(Response::builder().body(Full::new("Access Denied".into()).map_err(|e| match e {}).boxed())?),
+        response_status: Some(StatusCode::FORBIDDEN),
+        response_headers: None,
+        new_remote_address: None,
+      }),
+      BlockStatus::Allowed => Ok(ResponseData {
+        request: Some(request),
+        response: None,
+        response_status: None,
+        response_headers: None,
+        new_remote_address: None,
+      }),
+    }
   }
-
-  // Note: This module doesn't override response_modifying_handler
-  // so it uses the default implementation from the trait
 }
