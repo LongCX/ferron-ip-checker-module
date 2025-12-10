@@ -1,0 +1,82 @@
+# This GitHub Actions workflow checks if Ferron can be compiled with the module.
+
+name: Ferron module build
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  compile-test:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout the module repository
+      - name: Checkout module repository
+        uses: actions/checkout@v2
+        with:
+          path: "module"
+      # Checkout Ferron 2.x repository
+      - name: Checkout Ferron repository
+        uses: actions/checkout@v2
+        with:
+          repository: "ferronweb/ferron"
+          ref: "develop-2.x"
+          path: "ferron"
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "ferron -> target"
+      # Copy `ferron-build.yaml` to `ferron-build-override.yaml`. The `ferron-build-override.yaml` file will be later modified.
+      - name: Create Ferron compile-time configuration overrides
+        run: cp ferron/ferron-build.yaml ferron/ferron-build-override.yaml
+      # Modify Ferron compile-time configuration to add the module
+      # For this example, we will add the module after the module with the "CoreModuleLoader",
+      # as recommended in the README.
+      - name: Modify Ferron compile-time configuration
+        uses: mikefarah/yq@v4
+        with:
+          cmd: |
+            yq -i '.modules |= (
+                  (.[] | select(
+                    .loader == "CoreModuleLoader"
+                  ) | key + 1) as $pos |
+                  .[:$pos] +
+                  [
+                    {
+                      "path": "${{ github.workspace }}/module",
+                      "crate": "ferron-module-ip-block",
+                      "loader": "IpBlockModuleLoader"
+                    }
+                  ] +
+                  .[$pos:])' ferron/ferron-build-override.yaml
+      # Build Ferron with the module to check if it can be compiled
+      - name: Build Ferron
+        run: |
+          cd ferron
+          cargo run --manifest-path build-prepare/Cargo.toml
+          cd build-workspace
+          while [ "$OLD_CONFLICTING_PACKAGES" != "$CONFLICTING_PACKAGES" ] || [ "$OLD_CONFLICTING_PACKAGES" = "" ]; do \
+              OLD_CONFLICTING_PACKAGES=$CONFLICTING_PACKAGES; \
+              CONFLICTING_PACKAGES=$( (cargo update -w --dry-run 2>&1 || true) | grep -E '^error: failed to select a version for (the requirement )?`[^ `]+' | sed -E 's|[^`]*`([^ `]+).*|\1|' | xargs); \
+              if [ "$CONFLICTING_PACKAGES" = "" ]; then \
+                  break; \
+              fi; \
+              if [ "$OLD_CONFLICTING_PACKAGES" = "$CONFLICTING_PACKAGES" ]; then \
+                  echo "Couldn't resolve Cargo conflicts" >&2; \
+                  exit 1; \
+              fi; \
+              if [ "$CONFLICTING_PACKAGES" != "" ]; then \
+                  cargo update $CONFLICTING_PACKAGES || true; \
+              fi; \
+          done
+          cargo build -r --target-dir ../target
+          cd ..
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferron-module-ip-block-binaries
+          path: target/*
+          if-no-files-found: error
