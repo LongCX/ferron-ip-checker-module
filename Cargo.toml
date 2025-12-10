@@ -1,5 +1,5 @@
 [package]
-name = "ferron-ip-checker-module"
+name = "ferron-module-ip-block"
 version = "1.0.0"
 edition = "2021"
 

@@ -32,7 +32,7 @@ jobs:
       - name: Create Ferron compile-time configuration overrides
         run: cp ferron/ferron-build.yaml ferron/ferron-build-override.yaml
       # Modify Ferron compile-time configuration to add the module
-      # For this example, we will add the module after the module with the "ReverseProxyModuleLoader",
+      # For this example, we will add the module after the module with the "CoreModuleLoader",
       # as recommended in the README.
       - name: Modify Ferron compile-time configuration
         uses: mikefarah/yq@v4
