@@ -1,0 +1,23 @@
+[package]
+name = "ferron-module-example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.98"
+async-trait = "0.1.88"
+bytes = "1.10.1"
+ferron-common = { git = "https://github.com/ferronweb/ferron.git", branch = "develop-2.x", default-features = false }
+http-body-util = "0.1.3"
+hyper = "1.6.0"
+tokio = { version = "1.47.0", default-features = false }
+
+[dev-dependencies]
+shiba = "0.1.1"
+
+[features]
+default = ["runtime-monoio"]
+
+# Ferron uses one of two asynchronous Rust runtimes: Monoio or Tokio.
+runtime-monoio = ["ferron-common/runtime-monoio"]
+runtime-tokio = ["ferron-common/runtime-tokio"]
