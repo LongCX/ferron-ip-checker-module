@@ -32,10 +32,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            musl-tools musl-dev \
-            build-essential \
-            pkg-config \
-            libssl-dev
+            musl-tools musl-dev
 
       # 3. Cài Rust + target musl (để build static)
       - name: Install Rust toolchain
@@ -77,17 +74,6 @@ jobs:
 
       # 7. Build Ferron + module → binary 100% static
       - name: Build Ferron (fully static musl)
-        env:
-          # Bắt buộc bật vendored cho openssl và aws-lc để static
-          OPENSSL_DIR: /usr
-          OPENSSL_STATIC: "1"
-          OPENSSL_LIB_DIR: /usr/lib/x86_64-linux-gnu
-          OPENSSL_INCLUDE_DIR: /usr/include
-          # Fix aws-lc-sys khi cross musl
-          CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-gcc
-          # Force dùng vendored openssl thay vì hệ thống
-          OPENSSL_NO_VENDOR: 0
         run: |
           cd ferron
 
@@ -96,8 +82,7 @@ jobs:
 
           cd build-workspace
 
-          export CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc
-          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc
+          export RUSTFLAGS="-C target-feature=+crt-static"
 
           # Giải quyết xung đột phiên bản (nếu có) – giữ nguyên logic cũ nhưng an toàn hơn
           while true; do
@@ -110,7 +95,7 @@ jobs:
           done
 
           # Build static release
-          cargo build --release --target x86_64-unknown-linux-musl
+          cargo build --release --target x86_64-unknown-linux-musl --features vendored-openssl
 
           # Copy binary ra ngoài để dễ artifact
           mkdir -p ../../artifacts
