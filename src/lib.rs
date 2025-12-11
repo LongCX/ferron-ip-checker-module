@@ -27,6 +27,7 @@ struct ApiResponse {
 enum BlockStatus {
   Allowed,
   Blocked,
+  Error,
 }
 
 pub struct IpBlockModuleLoader {
@@ -171,13 +172,15 @@ impl ModuleHandlers for IpBlockModuleHandlers {
     error_logger: &ErrorLogger,
   ) -> Result<ResponseData, Box<dyn Error + Send + Sync>> {
     let remote_ip = socket_data.remote_addr.ip();
+    let client = self.client.clone();
+    let api_url = self.api_url.clone();
 
     let status_result = self
       .ip_cache
-      .get_with(remote_ip, async {
-        let full_url = format!("{}?ip={}", self.api_url, remote_ip);
+      .get_with(remote_ip, async move {
+        let full_url = format!("{}?ip={}", api_url, remote_ip);
 
-        match self.client.get(&full_url).send().await {
+        match client.get(&full_url).send().await {
           Ok(response) => {
             if response.status().is_success() {
               match response.json::<ApiResponse>().await {
@@ -188,45 +191,52 @@ impl ModuleHandlers for IpBlockModuleHandlers {
                     BlockStatus::Allowed
                   }
                 }
-                Err(e) => {
-                  error_logger
-                    .log(&format!(
-                      "[ip_block] Failed to parse JSON from API: {}. Allowing request.",
-                      e
-                    ))
-                    .await;
-                  BlockStatus::Allowed
-                }
+                Err(_) => BlockStatus::Error,
               }
             } else {
-              let status = response.status();
-              error_logger
-                .log(&format!(
-                  "[ip_block] API returned non-success status: {}. Allowing request.",
-                  status
-                ))
-                .await;
-              BlockStatus::Allowed
+              BlockStatus::Error
             }
           }
-          Err(e) => {
-            error_logger
-              .log(&format!("[ip_block] Failed to call API: {}. Allowing request.", e))
-              .await;
-            BlockStatus::Allowed
-          }
+          Err(_) => BlockStatus::Error,
         }
       })
       .await;
 
     match status_result {
-      BlockStatus::Blocked => Ok(ResponseData {
-        request: Some(request),
-        response: Some(Response::builder().body(Full::new("Access Denied".into()).map_err(|e| match e {}).boxed())?),
-        response_status: Some(StatusCode::FORBIDDEN),
-        response_headers: None,
-        new_remote_address: None,
-      }),
+      BlockStatus::Blocked => {
+        let body = Full::new(Bytes::from("Access Denied"))
+          .map_err(|never| match never {})
+          .boxed();
+
+        let response = Response::builder()
+          .status(StatusCode::FORBIDDEN)
+          .body(body)
+          .map_err(|e| -> Box<dyn Error + Send + Sync> { Box::new(e) })?;
+
+        Ok(ResponseData {
+          request: Some(request),
+          response: Some(response),
+          response_status: Some(StatusCode::FORBIDDEN),
+          response_headers: None,
+          new_remote_address: None,
+        })
+      }
+      BlockStatus::Error => {
+        error_logger
+          .log(&format!(
+            "[ip_block] Failed to check IP {}. Allowing request by default.",
+            remote_ip
+          ))
+          .await;
+
+        Ok(ResponseData {
+          request: Some(request),
+          response: None,
+          response_status: None,
+          response_headers: None,
+          new_remote_address: None,
+        })
+      }
       BlockStatus::Allowed => Ok(ResponseData {
         request: Some(request),
         response: None,
