@@ -28,6 +28,11 @@ jobs:
           ref: develop-2.x
           path: ferron
 
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools musl-dev
+
       # 3. Cài Rust + target musl (để build static)
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -75,6 +80,9 @@ jobs:
           cargo run --manifest-path build-prepare/Cargo.toml
 
           cd build-workspace
+
+          export CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc
 
           # Giải quyết xung đột phiên bản (nếu có) – giữ nguyên logic cũ nhưng an toàn hơn
           while true; do
