@@ -15,6 +15,7 @@ reqwest = { version = "0.12.25", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 moka = { version = "0.12.11", features = ["future"] }
 url = "2.5.7"
+openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
 shiba = "0.1.1"
