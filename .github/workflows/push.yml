@@ -1,5 +1,6 @@
-# .github/workflows/ferron-static-build.yml
-name: Ferron module static build
+# This GitHub Actions workflow checks if Ferron can be compiled with the module.
+
+name: Ferron module build
 
 on:
   push:
@@ -8,54 +9,33 @@ on:
     branches: ["main"]
 
 jobs:
-  build-static:
+  build-module:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
     steps:
-      # 1. Checkout module (repo hiện tại)
+      # Checkout the module repository
       - name: Checkout module repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v2
         with:
-          path: module
-
-      # 2. Checkout Ferron 2.x (develop-2.x)
+          path: "module"
+      # Checkout Ferron 2.x repository
       - name: Checkout Ferron repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v2
         with:
-          repository: ferronweb/ferron
-          ref: develop-2.x
-          path: ferron
-
-      - name: Install musl tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            musl-tools musl-dev
-
-      # 3. Cài Rust + target musl (để build static)
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          targets: x86_64-unknown-linux-musl
-
-      # 4. Cache Rust (target riêng cho musl để tránh xung đột với gnu)
-      - name: Cache cargo registry & build output
+          repository: "ferronweb/ferron"
+          ref: "develop-2.x"
+          path: "ferron"
+      - name: Setup cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            ferron -> target
-            module -> target
-
-      # 5. Tạo override config để thêm module
+          workspaces: "ferron -> target"
+      # Copy `ferron-build.yaml` to `ferron-build-override.yaml`. The `ferron-build-override.yaml` file will be later modified.
       - name: Create Ferron compile-time configuration overrides
         run: cp ferron/ferron-build.yaml ferron/ferron-build-override.yaml
-
-      # 6. Thêm module của bạn vào sau CoreModuleLoader (theo đúng khuyến nghị)
-      - name: Inject module into config
-        uses: mikefarah/yq@master
+      # Modify Ferron compile-time configuration to add the module
+      # For this example, we will add the module after the module with the "CoreModuleLoader",
+      # as recommended in the README.
+      - name: Modify Ferron compile-time configuration
+        uses: mikefarah/yq@v4
         with:
           cmd: |
             yq -i '.modules |= (
@@ -71,49 +51,32 @@ jobs:
                     }
                   ] +
                   .[$pos:])' ferron/ferron-build-override.yaml
-
-      # 7. Build Ferron + module → binary 100% static
-      - name: Build Ferron (fully static musl)
+      # Build Ferron with the module to check if it can be compiled
+      - name: Build Ferron
         run: |
           cd ferron
-
-          # Chuẩn bị workspace như Ferron yêu cầu
           cargo run --manifest-path build-prepare/Cargo.toml
-
           cd build-workspace
-
-          export RUSTFLAGS="-C target-feature=+crt-static"
-
-          # Giải quyết xung đột phiên bản (nếu có) – giữ nguyên logic cũ nhưng an toàn hơn
-          while true; do
-            CONFLICTS=$(cargo tree -i ferron-core -e normal --duplicates 2>/dev/null | grep -v "ferron-core" || true)
-            if [[ -z "$CONFLICTS" ]]; then
-              break
-            fi
-            echo "Resolving duplicate dependencies..."
-            cargo update --aggressive
+          while [ "$OLD_CONFLICTING_PACKAGES" != "$CONFLICTING_PACKAGES" ] || [ "$OLD_CONFLICTING_PACKAGES" = "" ]; do \
+              OLD_CONFLICTING_PACKAGES=$CONFLICTING_PACKAGES; \
+              CONFLICTING_PACKAGES=$( (cargo update -w --dry-run 2>&1 || true) | grep -E '^error: failed to select a version for (the requirement )?`[^ `]+' | sed -E 's|[^`]*`([^ `]+).*|\1|' | xargs); \
+              if [ "$CONFLICTING_PACKAGES" = "" ]; then \
+                  break; \
+              fi; \
+              if [ "$OLD_CONFLICTING_PACKAGES" = "$CONFLICTING_PACKAGES" ]; then \
+                  echo "Couldn't resolve Cargo conflicts" >&2; \
+                  exit 1; \
+              fi; \
+              if [ "$CONFLICTING_PACKAGES" != "" ]; then \
+                  cargo update $CONFLICTING_PACKAGES || true; \
+              fi; \
           done
+          cargo build -r --target-dir ../target
+          cd ..
 
-          # Build static release
-          cargo build --release --target x86_64-unknown-linux-musl --features vendored-openssl
-
-          # Copy binary ra ngoài để dễ artifact
-          mkdir -p ../../artifacts
-          find target/x86_64-unknown-linux-musl/release \
-            -maxdepth 1 -type f -executable \
-            -exec cp {} ../../artifacts/ \;
-
-      # 8. Kiểm tra binary thật sự static chưa (ldd phải báo "statically linked")
-      - name: Verify binary is static
-        run: |
-          file artifacts/* | grep "statically linked" || (echo "Binary không phải static!" && exit 1)
-          ldd artifacts/* 2>&1 | grep "statically linked" || (echo "ldd báo không static!" && exit 1)
-          echo "Binary đã được build 100% static thành công!"
-
-      # 9. Upload tất cả binary static (ferron, ferrond, ferron-cli, v.v.)
-      - name: Upload static binaries
+      - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ferron-module-ip-block-static-binaries
-          path: artifacts/*
+          name: ferron-module-ip-block-binaries
+          path: ferron/target/release/ferron
           if-no-files-found: error
