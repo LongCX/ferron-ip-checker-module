@@ -10,9 +10,9 @@ bytes = "1.10.1"
 ferron-common = { git = "https://github.com/ferronweb/ferron.git", branch = "develop-2.x", default-features = false }
 http-body-util = "0.1.3"
 hyper = "1.6.0"
-tokio = { version = "1.47.0", default-features = false }
+tokio = { version = "1.45.0", default-features = false }
 reqwest = { version = "0.12.25", features = ["json"] }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.219", features = ["derive"] }
 moka = { version = "0.12.11", features = ["future"] }
 url = "2.5.7"
 openssl = { version = "0.10", features = ["vendored"] }
