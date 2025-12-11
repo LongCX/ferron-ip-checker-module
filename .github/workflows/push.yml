@@ -53,14 +53,18 @@ jobs:
         with:
           cmd: |
             yq -i '.modules |= (
-              ([.[] | select(.loader == "ReplaceModuleLoader")] | length) as $core_count |
-              if $core_count == 0 then
-                . + [{"path": "${{ github.workspace }}/module", "crate": "ferron-module-ip-block", "loader": "IpBlockModuleLoader"}]
-              else
-                (.[] | select(.loader == "ReplaceModuleLoader") | key + 1) as $pos |
-                .[:\( pos] + [{"path": " \){{ github.workspace }}/module", "crate": "ferron-module-ip-block", "loader": "IpBlockModuleLoader"}] + .[$pos:]
-              end
-            )' ferron/ferron-build-override.yaml
+                  (.[] | select(
+                    .loader == "ReplaceModuleLoader"
+                  ) | key + 1) as $pos |
+                  .[:$pos] +
+                  [
+                    {
+                      "path": "${{ github.workspace }}/module",
+                      "crate": "ferron-module-ip-block",
+                      "loader": "IpBlockModuleLoader"
+                    }
+                  ] +
+                  .[$pos:])' ferron/ferron-build-override.yaml
 
       # 7. Build Ferron + module → binary 100% static
       - name: Build Ferron (fully static musl)
