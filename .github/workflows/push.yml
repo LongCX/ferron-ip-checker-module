@@ -71,7 +71,7 @@ jobs:
                   cargo update $CONFLICTING_PACKAGES || true; \
               fi; \
           done
-          cargo build -r --target-dir ../target
+          make build
           cd ..
 
       - name: Upload binary artifact
