@@ -1,16 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
-use moka::future::Cache;
 use serde::Deserialize;
+use tokio::sync::RwLock;
 
 use ferron_common::config::ServerConfiguration;
 use ferron_common::logging::ErrorLogger;
@@ -27,7 +27,12 @@ struct ApiResponse {
 enum BlockStatus {
   Allowed,
   Blocked,
-  Error,
+}
+
+#[derive(Clone, Debug)]
+struct CachedStatus {
+  status: BlockStatus,
+  expires_at: Instant,
 }
 
 pub struct IpBlockModuleLoader {
@@ -81,14 +86,11 @@ impl ModuleLoader for IpBlockModuleLoader {
             .timeout(Duration::from_secs(timeout_secs as u64))
             .build()?;
 
-          let ip_cache = Cache::builder()
-            .time_to_live(Duration::from_secs(cache_ttl_secs as u64))
-            .build();
-
           Ok(Arc::new(IpBlockModule {
             client: Arc::new(client),
             api_url,
-            ip_cache,
+            ip_cache: Arc::new(RwLock::new(HashMap::new())),
+            cache_ttl: Duration::from_secs(cache_ttl_secs as u64),
           }))
         })?,
     )
@@ -143,7 +145,8 @@ impl ModuleLoader for IpBlockModuleLoader {
 struct IpBlockModule {
   client: Arc<reqwest::Client>,
   api_url: String,
-  ip_cache: Cache<IpAddr, BlockStatus>,
+  ip_cache: Arc<RwLock<HashMap<IpAddr, CachedStatus>>>,
+  cache_ttl: Duration,
 }
 
 impl Module for IpBlockModule {
@@ -152,6 +155,7 @@ impl Module for IpBlockModule {
       client: self.client.clone(),
       api_url: self.api_url.clone(),
       ip_cache: self.ip_cache.clone(),
+      cache_ttl: self.cache_ttl,
     })
   }
 }
@@ -159,7 +163,8 @@ impl Module for IpBlockModule {
 struct IpBlockModuleHandlers {
   client: Arc<reqwest::Client>,
   api_url: String,
-  ip_cache: Cache<IpAddr, BlockStatus>,
+  ip_cache: Arc<RwLock<HashMap<IpAddr, CachedStatus>>>,
+  cache_ttl: Duration,
 }
 
 #[async_trait(?Send)]
@@ -172,37 +177,99 @@ impl ModuleHandlers for IpBlockModuleHandlers {
     error_logger: &ErrorLogger,
   ) -> Result<ResponseData, Box<dyn Error + Send + Sync>> {
     let remote_ip = socket_data.remote_addr.ip();
-    let client = self.client.clone();
-    let api_url = self.api_url.clone();
+    let now = Instant::now();
 
-    let status_result = self
-      .ip_cache
-      .get_with(remote_ip, async move {
-        let full_url = format!("{}?ip={}", api_url, remote_ip);
+    {
+      let cache_read = self.ip_cache.read().await;
+      if let Some(cached) = cache_read.get(&remote_ip) {
+        if cached.expires_at > now {
+          return match cached.status {
+            BlockStatus::Blocked => {
+              let body = Full::new(Bytes::from("Access Denied"))
+                .map_err(|never| match never {})
+                .boxed();
 
-        match client.get(&full_url).send().await {
-          Ok(response) => {
-            if response.status().is_success() {
-              match response.json::<ApiResponse>().await {
-                Ok(api_response) => {
-                  if api_response.blocked == 1 {
-                    BlockStatus::Blocked
-                  } else {
-                    BlockStatus::Allowed
-                  }
-                }
-                Err(_) => BlockStatus::Error,
+              let response = Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(body)
+                .map_err(|e| -> Box<dyn Error + Send + Sync> { Box::new(e) })?;
+
+              Ok(ResponseData {
+                request: Some(request),
+                response: Some(response),
+                response_status: Some(StatusCode::FORBIDDEN),
+                response_headers: None,
+                new_remote_address: None,
+              })
+            }
+            BlockStatus::Allowed => Ok(ResponseData {
+              request: Some(request),
+              response: None,
+              response_status: None,
+              response_headers: None,
+              new_remote_address: None,
+            }),
+          };
+        }
+      }
+    }
+
+    let full_url = format!("{}?ip={}", self.api_url, remote_ip);
+    let status = match self.client.get(&full_url).send().await {
+      Ok(response) => {
+        if response.status().is_success() {
+          match response.json::<ApiResponse>().await {
+            Ok(api_response) => {
+              if api_response.blocked == 1 {
+                BlockStatus::Blocked
+              } else {
+                BlockStatus::Allowed
               }
-            } else {
-              BlockStatus::Error
+            }
+            Err(e) => {
+              error_logger
+                .log(&format!(
+                  "[ip_block] Failed to parse JSON from API for IP {}: {}. Allowing request.",
+                  remote_ip, e
+                ))
+                .await;
+              BlockStatus::Allowed
             }
           }
-          Err(_) => BlockStatus::Error,
+        } else {
+          error_logger
+            .log(&format!(
+              "[ip_block] API returned status {} for IP {}. Allowing request.",
+              response.status(),
+              remote_ip
+            ))
+            .await;
+          BlockStatus::Allowed
         }
-      })
-      .await;
+      }
+      Err(e) => {
+        error_logger
+          .log(&format!(
+            "[ip_block] Failed to call API for IP {}: {}. Allowing request.",
+            remote_ip, e
+          ))
+          .await;
+        BlockStatus::Allowed
+      }
+    };
 
-    match status_result {
+    {
+      let mut cache_write = self.ip_cache.write().await;
+      cache_write.insert(
+        remote_ip,
+        CachedStatus {
+          status,
+          expires_at: now + self.cache_ttl,
+        },
+      );
+    }
+
+    match status {
       BlockStatus::Blocked => {
         let body = Full::new(Bytes::from("Access Denied"))
           .map_err(|never| match never {})
@@ -217,22 +284,6 @@ impl ModuleHandlers for IpBlockModuleHandlers {
           request: Some(request),
           response: Some(response),
           response_status: Some(StatusCode::FORBIDDEN),
-          response_headers: None,
-          new_remote_address: None,
-        })
-      }
-      BlockStatus::Error => {
-        error_logger
-          .log(&format!(
-            "[ip_block] Failed to check IP {}. Allowing request by default.",
-            remote_ip
-          ))
-          .await;
-
-        Ok(ResponseData {
-          request: Some(request),
-          response: None,
-          response_status: None,
           response_headers: None,
           new_remote_address: None,
         })
