@@ -9,7 +9,6 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
 use redis::AsyncCommands;
-use tokio::sync::RwLock;
 
 use ferron_common::config::ServerConfiguration;
 use ferron_common::logging::ErrorLogger;
@@ -75,20 +74,10 @@ impl ModuleLoader for IpBlockModuleLoader {
 
           let redis_client = secondary_runtime.block_on(async { redis::Client::open(redis_url.as_str()) })?;
 
-          let test_result = secondary_runtime.block_on(async {
-            let mut con = redis_client.get_multiplexed_async_connection().await?;
-            let _: () = redis::cmd("PING").query_async(&mut con).await?;
-            Ok::<_, redis::RedisError>(())
-          });
-
-          if let Err(e) = test_result {
-            return Err(format!("Failed to connect to Redis: {}", e).into());
-          }
-
           Ok(Arc::new(IpBlockModule {
             redis_client: Arc::new(redis_client),
             redis_key,
-            connection_pool: Arc::new(RwLock::new(None)),
+            runtime: secondary_runtime.handle().clone(),
           }))
         })?,
     )
@@ -131,7 +120,7 @@ impl ModuleLoader for IpBlockModuleLoader {
 struct IpBlockModule {
   redis_client: Arc<redis::Client>,
   redis_key: String,
-  connection_pool: Arc<RwLock<Option<redis::aio::MultiplexedConnection>>>,
+  runtime: tokio::runtime::Handle,
 }
 
 impl Module for IpBlockModule {
@@ -139,7 +128,7 @@ impl Module for IpBlockModule {
     Box::new(IpBlockModuleHandlers {
       redis_client: self.redis_client.clone(),
       redis_key: self.redis_key.clone(),
-      connection_pool: self.connection_pool.clone(),
+      runtime: self.runtime.clone(),
     })
   }
 }
@@ -147,7 +136,7 @@ impl Module for IpBlockModule {
 struct IpBlockModuleHandlers {
   redis_client: Arc<redis::Client>,
   redis_key: String,
-  connection_pool: Arc<RwLock<Option<redis::aio::MultiplexedConnection>>>,
+  runtime: tokio::runtime::Handle,
 }
 
 #[async_trait(?Send)]
@@ -161,33 +150,14 @@ impl ModuleHandlers for IpBlockModuleHandlers {
   ) -> Result<ResponseData, Box<dyn Error + Send + Sync>> {
     let remote_ip = convert_ip(socket_data.remote_addr.ip());
 
-    let mut con = {
-      let mut pool = self.connection_pool.write().await;
+    let client = self.redis_client.clone();
 
-      if pool.is_none() {
-        match self.redis_client.get_multiplexed_async_connection().await {
-          Ok(connection) => {
-            *pool = Some(connection);
-          }
-          Err(e) => {
-            error_logger
-              .log(&format!("[ip_block] Failed to connect to Redis: {}", e))
-              .await;
-            return Ok(ResponseData {
-              request: Some(request),
-              response: None,
-              response_status: None,
-              response_headers: None,
-              new_remote_address: None,
-            });
-          }
-        }
-      }
+    let mut con = self
+      .runtime
+      .spawn(async move { client.get_multiplexed_async_connection().await })
+      .await??;
 
-      pool.clone().unwrap()
-    };
-
-    let is_blocked = match self.check_ip_in_redis(&mut con, remote_ip).await {
+    let is_blocked = match con.sismember(&self.redis_key, remote_ip.to_string()).await {
       Ok(blocked) => {
         error_logger.log(&format!("[ip_block] Blocked IP: {}", remote_ip)).await;
         blocked
@@ -196,10 +166,6 @@ impl ModuleHandlers for IpBlockModuleHandlers {
         error_logger
           .log(&format!("[ip_block] Redis error for IP {}: {}", remote_ip, e))
           .await;
-
-        let mut pool = self.connection_pool.write().await;
-        *pool = None;
-
         false
       }
     };
@@ -220,17 +186,5 @@ impl ModuleHandlers for IpBlockModuleHandlers {
       response_headers: None,
       new_remote_address: None,
     })
-  }
-}
-
-impl IpBlockModuleHandlers {
-  async fn check_ip_in_redis(
-    &self,
-    con: &mut redis::aio::MultiplexedConnection,
-    ip: IpAddr,
-  ) -> Result<bool, Box<dyn Error + Send + Sync>> {
-    let ip_str = ip.to_string();
-    let is_member: bool = con.sismember(&self.redis_key, &ip_str).await?;
-    Ok(is_member)
   }
 }
