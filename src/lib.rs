@@ -151,25 +151,27 @@ impl ModuleHandlers for IpBlockModuleHandlers {
     let remote_ip = convert_ip(socket_data.remote_addr.ip());
 
     let client = self.redis_client.clone();
+    let redis_key = self.redis_key.clone();
 
-    let mut con = self
-      .runtime
-      .spawn(async move { client.get_multiplexed_async_connection().await })
-      .await??;
+    let result_blocked = self.runtime.spawn(async move {
+      let mut conn = client.get_multiplexed_async_connection().await?;
+      let is_blocked: bool = conn.sismember(redis_key, remote_ip.to_string()).await?;
+      Ok(is_blocked) as Result<bool, redis::RedisError>
+    });
 
-    let is_blocked = match con.sismember(&self.redis_key, remote_ip.to_string()).await {
-      Ok(blocked) => {
-        error_logger.log(&format!("[ip_block] Blocked IP: {}", remote_ip)).await;
-        blocked
+    let is_blocked = match result_blocked.await {
+      Ok(Ok(blocked)) => blocked,
+      Ok(Err(e)) => {
+        error_logger.log(&format!("Redis error in IpBlockModule: {}", e)).await;
+        false
       }
       Err(e) => {
         error_logger
-          .log(&format!("[ip_block] Redis error for IP {}: {}", remote_ip, e))
+          .log(&format!("Task join error in IpBlockModule: {}", e))
           .await;
         false
       }
     };
-
     let response = Response::builder()
       .status(StatusCode::FORBIDDEN)
       .body(
