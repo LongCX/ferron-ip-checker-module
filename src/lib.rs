@@ -80,9 +80,8 @@ impl ModuleLoader for IpBlockModuleLoader {
           let cache_ttl_secs = block_entry
             .and_then(|e| e.props.get("cache_ttl"))
             .and_then(|v| v.as_i128())
-            .unwrap_or(3600);
+            .unwrap_or(900);
 
-          // Build client trong secondary runtime context
           let client = secondary_runtime.block_on(async {
             reqwest::Client::builder()
               .timeout(Duration::from_secs(timeout_secs as u64))
