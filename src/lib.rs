@@ -53,6 +53,19 @@ impl IpBlockModuleLoader {
   }
 }
 
+fn convert_ip(ip: IpAddr) -> IpAddr {
+  match ip {
+    IpAddr::V6(ipv6) => {
+      if let Some(ipv4) = ipv6.to_ipv4() {
+        IpAddr::V4(ipv4)
+      } else {
+        IpAddr::V6(ipv6)
+      }
+    }
+    IpAddr::V4(ipv4) => IpAddr::V4(ipv4),
+  }
+}
+
 impl ModuleLoader for IpBlockModuleLoader {
   fn load_module(
     &mut self,
@@ -182,7 +195,7 @@ impl ModuleHandlers for IpBlockModuleHandlers {
     socket_data: &SocketData,
     error_logger: &ErrorLogger,
   ) -> Result<ResponseData, Box<dyn Error + Send + Sync>> {
-    let remote_ip = socket_data.remote_addr.ip();
+    let remote_ip = convert_ip(socket_data.remote_addr.ip());
     let now = Instant::now();
 
     {
@@ -247,7 +260,7 @@ impl ModuleHandlers for IpBlockModuleHandlers {
             Ok(Err(e)) => {
               error_logger
                 .log(&format!(
-                  "[ip_block] Failed to parse JSON from API for IP {}: {}. Allowing request.",
+                  "[ip_block] Failed to parse JSON from API for IP {}: {}",
                   remote_ip, e
                 ))
                 .await;
@@ -255,10 +268,7 @@ impl ModuleHandlers for IpBlockModuleHandlers {
             }
             Err(e) => {
               error_logger
-                .log(&format!(
-                  "[ip_block] Failed to parse JSON from API for IP {}: {}. Allowing request.",
-                  remote_ip, e
-                ))
+                .log(&format!("[ip_block] Failed to join JSON parsing task: {}", e))
                 .await;
               BlockStatus::Allowed
             }
@@ -267,7 +277,7 @@ impl ModuleHandlers for IpBlockModuleHandlers {
           let status_code = response.status();
           error_logger
             .log(&format!(
-              "[ip_block] API returned status {} for IP {}. Allowing request.",
+              "[ip_block] API returned status {} for IP {}",
               status_code, remote_ip
             ))
             .await;
@@ -276,19 +286,13 @@ impl ModuleHandlers for IpBlockModuleHandlers {
       }
       Ok(Err(e)) => {
         error_logger
-          .log(&format!(
-            "[ip_block] Failed to call API for IP {}: {}. Allowing request.",
-            remote_ip, e
-          ))
+          .log(&format!("[ip_block] Failed to call API for IP {}: {}", remote_ip, e))
           .await;
         BlockStatus::Allowed
       }
       Err(e) => {
         error_logger
-          .log(&format!(
-            "[ip_block] Failed to call API for IP {}: {}. Allowing request.",
-            remote_ip, e
-          ))
+          .log(&format!("[ip_block] Failed to spawn API request task: {}", e))
           .await;
         BlockStatus::Allowed
       }
