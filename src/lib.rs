@@ -58,7 +58,7 @@ impl ModuleLoader for IpBlockModuleLoader {
     &mut self,
     config: &ServerConfiguration,
     _global_config: Option<&ServerConfiguration>,
-    _secondary_runtime: &tokio::runtime::Runtime,
+    secondary_runtime: &tokio::runtime::Runtime,
   ) -> Result<Arc<dyn Module + Send + Sync>, Box<dyn Error + Send + Sync>> {
     Ok(
       self
@@ -82,15 +82,19 @@ impl ModuleLoader for IpBlockModuleLoader {
             .and_then(|v| v.as_i128())
             .unwrap_or(3600);
 
-          let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs as u64))
-            .build()?;
+          // Build client trong secondary runtime context
+          let client = secondary_runtime.block_on(async {
+            reqwest::Client::builder()
+              .timeout(Duration::from_secs(timeout_secs as u64))
+              .build()
+          })?;
 
           Ok(Arc::new(IpBlockModule {
             client: Arc::new(client),
             api_url,
             ip_cache: Arc::new(RwLock::new(HashMap::new())),
             cache_ttl: Duration::from_secs(cache_ttl_secs as u64),
+            runtime: secondary_runtime.handle().clone(),
           }))
         })?,
     )
@@ -147,6 +151,7 @@ struct IpBlockModule {
   api_url: String,
   ip_cache: Arc<RwLock<HashMap<IpAddr, CachedStatus>>>,
   cache_ttl: Duration,
+  runtime: tokio::runtime::Handle,
 }
 
 impl Module for IpBlockModule {
@@ -156,6 +161,7 @@ impl Module for IpBlockModule {
       api_url: self.api_url.clone(),
       ip_cache: self.ip_cache.clone(),
       cache_ttl: self.cache_ttl,
+      runtime: self.runtime.clone(),
     })
   }
 }
@@ -165,6 +171,7 @@ struct IpBlockModuleHandlers {
   api_url: String,
   ip_cache: Arc<RwLock<HashMap<IpAddr, CachedStatus>>>,
   cache_ttl: Duration,
+  runtime: tokio::runtime::Handle,
 }
 
 #[async_trait(?Send)]
@@ -214,17 +221,38 @@ impl ModuleHandlers for IpBlockModuleHandlers {
       }
     }
 
+    let client = self.client.clone();
     let full_url = format!("{}?ip={}", self.api_url, remote_ip);
-    let status = match self.client.get(&full_url).send().await {
-      Ok(response) => {
+
+    let api_call_result = self
+      .runtime
+      .spawn(async move { client.get(&full_url).send().await })
+      .await;
+
+    let status = match api_call_result {
+      Ok(Ok(response)) => {
         if response.status().is_success() {
-          match response.json::<ApiResponse>().await {
-            Ok(api_response) => {
+          let json_result = self
+            .runtime
+            .spawn(async move { response.json::<ApiResponse>().await })
+            .await;
+
+          match json_result {
+            Ok(Ok(api_response)) => {
               if api_response.blocked == 1 {
                 BlockStatus::Blocked
               } else {
                 BlockStatus::Allowed
               }
+            }
+            Ok(Err(e)) => {
+              error_logger
+                .log(&format!(
+                  "[ip_block] Failed to parse JSON from API for IP {}: {}. Allowing request.",
+                  remote_ip, e
+                ))
+                .await;
+              BlockStatus::Allowed
             }
             Err(e) => {
               error_logger
@@ -237,15 +265,24 @@ impl ModuleHandlers for IpBlockModuleHandlers {
             }
           }
         } else {
+          let status_code = response.status();
           error_logger
             .log(&format!(
               "[ip_block] API returned status {} for IP {}. Allowing request.",
-              response.status(),
-              remote_ip
+              status_code, remote_ip
             ))
             .await;
           BlockStatus::Allowed
         }
+      }
+      Ok(Err(e)) => {
+        error_logger
+          .log(&format!(
+            "[ip_block] Failed to call API for IP {}: {}. Allowing request.",
+            remote_ip, e
+          ))
+          .await;
+        BlockStatus::Allowed
       }
       Err(e) => {
         error_logger
