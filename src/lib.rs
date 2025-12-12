@@ -9,6 +9,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
 use redis::AsyncCommands;
+use tokio::sync::RwLock;
 
 use ferron_common::config::ServerConfiguration;
 use ferron_common::logging::ErrorLogger;
@@ -52,7 +53,7 @@ impl ModuleLoader for IpBlockModuleLoader {
     &mut self,
     config: &ServerConfiguration,
     _global_config: Option<&ServerConfiguration>,
-    _secondary_runtime: &tokio::runtime::Runtime,
+    secondary_runtime: &tokio::runtime::Runtime,
   ) -> Result<Arc<dyn Module + Send + Sync>, Box<dyn Error + Send + Sync>> {
     Ok(
       self
@@ -72,7 +73,23 @@ impl ModuleLoader for IpBlockModuleLoader {
             .unwrap_or("blocked_ips")
             .to_string();
 
-          Ok(Arc::new(IpBlockModule { redis_url, redis_key }))
+          let redis_client = secondary_runtime.block_on(async { redis::Client::open(redis_url.as_str()) })?;
+
+          let test_result = secondary_runtime.block_on(async {
+            let mut con = redis_client.get_multiplexed_async_connection().await?;
+            let _: () = redis::cmd("PING").query_async(&mut con).await?;
+            Ok::<_, redis::RedisError>(())
+          });
+
+          if let Err(e) = test_result {
+            return Err(format!("Failed to connect to Redis: {}", e).into());
+          }
+
+          Ok(Arc::new(IpBlockModule {
+            redis_client: Arc::new(redis_client),
+            redis_key,
+            connection_pool: Arc::new(RwLock::new(None)),
+          }))
         })?,
     )
   }
@@ -112,24 +129,25 @@ impl ModuleLoader for IpBlockModuleLoader {
 }
 
 struct IpBlockModule {
-  redis_url: String,
+  redis_client: Arc<redis::Client>,
   redis_key: String,
+  connection_pool: Arc<RwLock<Option<redis::aio::MultiplexedConnection>>>,
 }
 
 impl Module for IpBlockModule {
   fn get_module_handlers(&self) -> Box<dyn ModuleHandlers> {
     Box::new(IpBlockModuleHandlers {
-      redis_url: self.redis_url.clone(),
+      redis_client: self.redis_client.clone(),
       redis_key: self.redis_key.clone(),
-      redis_client: None,
+      connection_pool: self.connection_pool.clone(),
     })
   }
 }
 
 struct IpBlockModuleHandlers {
-  redis_url: String,
+  redis_client: Arc<redis::Client>,
   redis_key: String,
-  redis_client: Option<redis::Client>,
+  connection_pool: Arc<RwLock<Option<redis::aio::MultiplexedConnection>>>,
 }
 
 #[async_trait(?Send)]
@@ -143,25 +161,33 @@ impl ModuleHandlers for IpBlockModuleHandlers {
   ) -> Result<ResponseData, Box<dyn Error + Send + Sync>> {
     let remote_ip = convert_ip(socket_data.remote_addr.ip());
 
-    if self.redis_client.is_none() {
-      match redis::Client::open(self.redis_url.as_str()) {
-        Ok(client) => self.redis_client = Some(client),
-        Err(e) => {
-          error_logger
-            .log(&format!("[ip_block] Failed to create Redis client: {}", e))
-            .await;
-          return Ok(ResponseData {
-            request: Some(request),
-            response: None,
-            response_status: None,
-            response_headers: None,
-            new_remote_address: None,
-          });
+    let mut con = {
+      let mut pool = self.connection_pool.write().await;
+
+      if pool.is_none() {
+        match self.redis_client.get_multiplexed_async_connection().await {
+          Ok(connection) => {
+            *pool = Some(connection);
+          }
+          Err(e) => {
+            error_logger
+              .log(&format!("[ip_block] Failed to connect to Redis: {}", e))
+              .await;
+            return Ok(ResponseData {
+              request: Some(request),
+              response: None,
+              response_status: None,
+              response_headers: None,
+              new_remote_address: None,
+            });
+          }
         }
       }
-    }
 
-    let is_blocked = match self.check_ip_in_redis(remote_ip).await {
+      pool.clone().unwrap()
+    };
+
+    let is_blocked = match self.check_ip_in_redis(&mut con, remote_ip).await {
       Ok(blocked) => {
         error_logger.log(&format!("[ip_block] Blocked IP: {}", remote_ip)).await;
         blocked
@@ -170,6 +196,10 @@ impl ModuleHandlers for IpBlockModuleHandlers {
         error_logger
           .log(&format!("[ip_block] Redis error for IP {}: {}", remote_ip, e))
           .await;
+
+        let mut pool = self.connection_pool.write().await;
+        *pool = None;
+
         false
       }
     };
@@ -194,14 +224,13 @@ impl ModuleHandlers for IpBlockModuleHandlers {
 }
 
 impl IpBlockModuleHandlers {
-  async fn check_ip_in_redis(&self, ip: IpAddr) -> Result<bool, Box<dyn Error + Send + Sync>> {
-    let client = self.redis_client.as_ref().ok_or("Redis client not initialized")?;
-
-    let mut con = client.get_multiplexed_async_connection().await?;
-
+  async fn check_ip_in_redis(
+    &self,
+    con: &mut redis::aio::MultiplexedConnection,
+    ip: IpAddr,
+  ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let ip_str = ip.to_string();
     let is_member: bool = con.sismember(&self.redis_key, &ip_str).await?;
-
     Ok(is_member)
   }
 }
