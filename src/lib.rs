@@ -6,8 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
-use hyper::{Request, Response, StatusCode};
+use hyper::{Request, StatusCode};
 use redis::AsyncCommands;
 
 use ferron_common::config::ServerConfiguration;
@@ -175,19 +174,11 @@ impl ModuleHandlers for IpBlockModuleHandlers {
         false
       }
     };
-    let response = Response::builder()
-      .status(StatusCode::FORBIDDEN)
-      .body(
-        Full::new(Bytes::from("Access Denied"))
-          .map_err(|never| match never {})
-          .boxed(),
-      )
-      .map_err(|e| -> Box<dyn Error + Send + Sync> { Box::new(e) })?;
 
     Ok(ResponseData {
       request: Some(request),
-      response: if is_blocked { Some(response) } else { None },
-      response_status: None,
+      response: None,
+      response_status: if is_blocked { Some(StatusCode::FORBIDDEN) } else { None },
       response_headers: None,
       new_remote_address: None,
     })
