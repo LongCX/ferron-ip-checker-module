@@ -160,7 +160,9 @@ impl ModuleHandlers for IpBlockModuleHandlers {
 
     let is_blocked = match result_blocked.await {
       Ok(Ok(blocked)) => {
-        error_logger.log(&format!("Blocked IP: {}", remote_ip)).await;
+        if blocked {
+          error_logger.log(&format!("Blocked IP: {}", remote_ip)).await;
+        }
         blocked
       }
       Ok(Err(e)) => {
