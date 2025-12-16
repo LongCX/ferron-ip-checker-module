@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::error::Error;
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -30,19 +29,6 @@ impl IpBlockModuleLoader {
     Self {
       cache: ModuleCache::new(vec!["ip_block"]),
     }
-  }
-}
-
-fn convert_ip(ip: IpAddr) -> IpAddr {
-  match ip {
-    IpAddr::V6(ipv6) => {
-      if let Some(ipv4) = ipv6.to_ipv4() {
-        IpAddr::V4(ipv4)
-      } else {
-        IpAddr::V6(ipv6)
-      }
-    }
-    IpAddr::V4(ipv4) => IpAddr::V4(ipv4),
   }
 }
 
@@ -147,7 +133,7 @@ impl ModuleHandlers for IpBlockModuleHandlers {
     socket_data: &SocketData,
     error_logger: &ErrorLogger,
   ) -> Result<ResponseData, Box<dyn Error + Send + Sync>> {
-    let remote_ip = convert_ip(socket_data.remote_addr.ip());
+    let remote_ip = socket_data.remote_addr.ip().to_canonical();
 
     let client = self.redis_client.clone();
     let redis_key = self.redis_key.clone();
